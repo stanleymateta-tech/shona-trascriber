@@ -21,57 +21,74 @@ Part of [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyarad
 
 st.divider()
 
-AWS_SERVER = None  # Set to "http://YOUR-AWS-IP:5000" when server is running
+AWS_SERVER = None  # Set to "http://YOUR-AWS-IP:5000" when running
 
 SUPPORTED_TYPES = [
     "wav", "flac", "ogg", "mp3", "m4a", "mp4",
-    "mov", "avi", "mkv", "webm", "aac", "wma", "opus"
+    "mov", "avi", "mkv", "webm", "aac", "opus"
 ]
 
-def extract_audio(audio_bytes, suffix):
-    """Extract and convert audio to 16kHz mono float32 numpy array."""
+def extract_audio_ffmpeg(input_path, output_path):
+    """Use ffmpeg binary to convert any format to 16kHz WAV."""
+    import subprocess
+    result = subprocess.run([
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-ar", "16000",
+        "-ac", "1",
+        "-f", "wav",
+        output_path
+    ], capture_output=True, text=True)
+    return result.returncode == 0
+
+def get_audio_array(audio_bytes, suffix):
+    """Convert uploaded file to numpy float32 array at 16kHz."""
     import numpy as np
-    import io
+    import tempfile, os
     import soundfile as sf
 
-    # Try soundfile first (WAV, FLAC, OGG, OPUS work natively)
-    try:
-        audio_array, sr = sf.read(io.BytesIO(audio_bytes))
-        if len(audio_array.shape) > 1:
-            audio_array = audio_array.mean(axis=1)
-        if sr != 16000:
-            import librosa
-            audio_array = librosa.resample(
-                audio_array.astype(np.float32), orig_sr=sr, target_sr=16000)
-        return audio_array.astype(np.float32)
-    except Exception:
-        pass
-
-    # Fall back to pydub which handles MP3, M4A, AAC, WMA, video files
-    try:
-        from pydub import AudioSegment
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(audio_bytes)
-            tmp_in = f.name
-        audio = AudioSegment.from_file(tmp_in)
-        audio = audio.set_channels(1).set_frame_rate(16000)
-        samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
-        samples /= np.iinfo(audio.array_type).max
-        os.unlink(tmp_in)
-        return samples
-    except Exception:
-        pass
-
-    # Last resort — write to disk and let transformers/librosa handle it
-    import tempfile, os
-    import librosa
+    # Write uploaded bytes to a temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(audio_bytes)
         tmp_in = f.name
-    audio_array, sr = librosa.load(tmp_in, sr=16000, mono=True)
-    os.unlink(tmp_in)
-    return audio_array.astype(np.float32)
+
+    tmp_wav = tmp_in.replace(suffix, "_converted.wav")
+
+    try:
+        # Try direct soundfile read first (WAV, FLAC, OGG)
+        try:
+            audio_array, sr = sf.read(tmp_in)
+            if len(audio_array.shape) > 1:
+                audio_array = audio_array.mean(axis=1)
+            if sr != 16000:
+                import librosa
+                audio_array = librosa.resample(
+                    audio_array.astype(np.float32),
+                    orig_sr=sr, target_sr=16000)
+            return audio_array.astype(np.float32)
+        except Exception:
+            pass
+
+        # Use ffmpeg to convert to WAV then read
+        success = extract_audio_ffmpeg(tmp_in, tmp_wav)
+        if success and os.path.exists(tmp_wav):
+            audio_array, sr = sf.read(tmp_wav)
+            if len(audio_array.shape) > 1:
+                audio_array = audio_array.mean(axis=1)
+            return audio_array.astype(np.float32)
+
+        # Last resort: librosa
+        import librosa
+        audio_array, _ = librosa.load(tmp_in, sr=16000, mono=True)
+        return audio_array.astype(np.float32)
+
+    finally:
+        for p in [tmp_in, tmp_wav]:
+            try:
+                if os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
 
 def transcribe_local(audio_array):
     import transformers
@@ -120,7 +137,7 @@ else:
     st.info("ℹ️ Using local CPU — transcription takes 1-2 minutes per file")
 
 st.subheader("Upload a file")
-st.caption("Supported: WAV · FLAC · OGG · MP3 · M4A · AAC · WMA · MP4 · MOV · AVI · MKV · WEBM · OPUS")
+st.caption("Supported: WAV · FLAC · OGG · MP3 · M4A · AAC · MP4 · MOV · AVI · MKV · WEBM · OPUS")
 
 uploaded_file = st.file_uploader(
     "Choose an audio or video file",
@@ -132,7 +149,6 @@ if uploaded_file is not None:
     suffix = "." + uploaded_file.name.split(".")[-1].lower()
     audio_bytes = uploaded_file.read()
 
-    # Show preview if audio/video
     if suffix in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
         st.video(uploaded_file)
         st.caption("Video uploaded — will extract and transcribe the audio track")
@@ -145,45 +161,44 @@ if uploaded_file is not None:
                 with st.spinner("Transcribing on AWS GPU server..."):
                     text = transcribe_aws(audio_bytes, AWS_SERVER, suffix)
             else:
-                with st.spinner("Extracting audio and transcribing... (1-2 minutes)"):
-                    audio_array = extract_audio(audio_bytes, suffix)
+                with st.spinner("Processing... this takes 1-2 minutes"):
+                    audio_array = get_audio_array(audio_bytes, suffix)
                     text = transcribe_local(audio_array)
 
             if text:
                 st.success("Transcription complete!")
                 st.text_area("Shona Transcript", value=text, height=200)
                 col1, col2 = st.columns(2)
+                base_name = uploaded_file.name.rsplit(".", 1)[0]
                 with col1:
                     st.download_button(
                         label="📄 Download as .txt",
                         data=text,
-                        file_name=uploaded_file.name.rsplit(".", 1)[0] + "_transcript.txt",
+                        file_name=base_name + "_transcript.txt",
                         mime="text/plain",
                         use_container_width=True,
                     )
                 with col2:
-                    # Also offer SRT subtitle format
                     srt = f"1\n00:00:00,000 --> 00:05:00,000\n{text}\n"
                     st.download_button(
                         label="🎬 Download as .srt (subtitles)",
                         data=srt,
-                        file_name=uploaded_file.name.rsplit(".", 1)[0] + ".srt",
+                        file_name=base_name + ".srt",
                         mime="text/plain",
                         use_container_width=True,
                     )
             else:
-                st.warning("No speech detected. Please try a clearer recording.")
+                st.warning("No speech detected. Try a clearer recording.")
 
         except Exception as e:
             st.error(f"Could not process file: {str(e)}")
-            st.info("If your file is not working, try converting it to WAV first "
-                    "using any free online converter, then upload again.")
+            st.info("Try converting your file to WAV using a free online converter, then upload again.")
 
 st.divider()
 st.markdown("""
 ### Tips for best results:
-- Any audio or video format works
-- Speak clearly at normal pace  
+- Any audio or video format is supported
+- Speak clearly at normal pace
 - Reduce background noise where possible
 - Longer files take more time on CPU
 
