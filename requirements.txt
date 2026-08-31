@@ -3,5 +3,6 @@ transformers
 torch
 soundfile
 librosa
-pydub
+noisereduce
+pyannote.audio
 ffmpeg-python
