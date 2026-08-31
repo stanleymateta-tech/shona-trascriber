@@ -11,9 +11,8 @@ st.set_page_config(
 st.title("🎙 Project Nyaradzai — Shona Transcriber 🇿🇼")
 st.markdown("""
 **The first open Shona (ChiShona) speech transcription tool.**
-
-Upload any audio or video file and get a Shona transcript instantly.
-Built on [whisper-small-shona](https://huggingface.co/Starsm91/whisper-small-shona) — WER 36.42%.
+Upload any audio or video file and get a Shona transcript.
+Your corrections help train the next, more accurate version.
 
 Part of [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai) —
 *Mutauro wedu, panyika yose* 🇿🇼
@@ -21,41 +20,24 @@ Part of [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyarad
 
 st.divider()
 
-AWS_SERVER = None  # Set to "http://YOUR-AWS-IP:5000" when running
-
+AWS_SERVER = None
 SUPPORTED_TYPES = [
     "wav", "flac", "ogg", "mp3", "m4a", "mp4",
     "mov", "avi", "mkv", "webm", "aac", "opus"
 ]
 
-def extract_audio_ffmpeg(input_path, output_path):
-    """Use ffmpeg binary to convert any format to 16kHz WAV."""
-    import subprocess
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-i", input_path,
-        "-ar", "16000",
-        "-ac", "1",
-        "-f", "wav",
-        output_path
-    ], capture_output=True, text=True)
-    return result.returncode == 0
-
+# ── audio extraction ──────────────────────────────────────────────────────────
 def get_audio_array(audio_bytes, suffix):
-    """Convert uploaded file to numpy float32 array at 16kHz."""
     import numpy as np
     import tempfile, os
     import soundfile as sf
 
-    # Write uploaded bytes to a temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(audio_bytes)
         tmp_in = f.name
-
     tmp_wav = tmp_in.replace(suffix, "_converted.wav")
 
     try:
-        # Try direct soundfile read first (WAV, FLAC, OGG)
         try:
             audio_array, sr = sf.read(tmp_in)
             if len(audio_array.shape) > 1:
@@ -63,21 +45,22 @@ def get_audio_array(audio_bytes, suffix):
             if sr != 16000:
                 import librosa
                 audio_array = librosa.resample(
-                    audio_array.astype(np.float32),
-                    orig_sr=sr, target_sr=16000)
+                    audio_array.astype(np.float32), orig_sr=sr, target_sr=16000)
             return audio_array.astype(np.float32)
         except Exception:
             pass
 
-        # Use ffmpeg to convert to WAV then read
-        success = extract_audio_ffmpeg(tmp_in, tmp_wav)
-        if success and os.path.exists(tmp_wav):
+        import subprocess
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", tmp_in,
+            "-ar", "16000", "-ac", "1", "-f", "wav", tmp_wav
+        ], capture_output=True)
+        if result.returncode == 0 and os.path.exists(tmp_wav):
             audio_array, sr = sf.read(tmp_wav)
             if len(audio_array.shape) > 1:
                 audio_array = audio_array.mean(axis=1)
             return audio_array.astype(np.float32)
 
-        # Last resort: librosa
         import librosa
         audio_array, _ = librosa.load(tmp_in, sr=16000, mono=True)
         return audio_array.astype(np.float32)
@@ -85,11 +68,11 @@ def get_audio_array(audio_bytes, suffix):
     finally:
         for p in [tmp_in, tmp_wav]:
             try:
-                if os.path.exists(p):
-                    os.unlink(p)
+                if os.path.exists(p): os.unlink(p)
             except Exception:
                 pass
 
+# ── transcription ─────────────────────────────────────────────────────────────
 def transcribe_local(audio_array):
     import transformers
     transformers.logging.set_verbosity_error()
@@ -106,43 +89,69 @@ def transcribe_local(audio_array):
     )
     return result["text"].strip()
 
-def transcribe_aws(audio_bytes, server_url, suffix):
-    import requests, io
-    response = requests.post(
-        f"{server_url}/transcribe",
-        files={"audio": (f"audio{suffix}", io.BytesIO(audio_bytes))},
-        timeout=60
-    )
-    data = response.json()
-    if data.get("success"):
-        return data["text"]
-    raise Exception(data.get("error", "Server error"))
-
-def check_aws(server_url):
-    import requests
+# ── feedback storage ──────────────────────────────────────────────────────────
+def save_correction(audio_bytes, suffix, original_text, corrected_text, filename):
+    """
+    Save a user correction to the Hugging Face dataset repository.
+    Each correction = audio file + original transcript + corrected transcript.
+    These accumulate as training data for the next model version.
+    """
     try:
-        r = requests.get(f"{server_url}/health", timeout=3)
-        return r.status_code == 200
-    except Exception:
+        from huggingface_hub import HfApi
+        import tempfile, os, json
+        from datetime import datetime
+
+        api = HfApi()
+        repo_id = "Starsm91/shona-corrections"
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+
+        # Save audio
+        audio_filename = f"audio/{timestamp}{suffix}"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            f.write(audio_bytes)
+            tmp_audio = f.name
+
+        api.upload_file(
+            path_or_fileobj=tmp_audio,
+            path_in_repo=audio_filename,
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        os.unlink(tmp_audio)
+
+        # Save metadata
+        meta = {
+            "timestamp": timestamp,
+            "filename": filename,
+            "audio_path": audio_filename,
+            "original": original_text,
+            "corrected": corrected_text,
+        }
+        meta_json = json.dumps(meta, ensure_ascii=False, indent=2)
+        meta_filename = f"corrections/{timestamp}.json"
+        api.upload_file(
+            path_or_fileobj=meta_json.encode(),
+            path_in_repo=meta_filename,
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        return True
+    except Exception as e:
+        st.warning(f"Could not save correction: {e}")
         return False
 
-# Connection status
+# ── UI ────────────────────────────────────────────────────────────────────────
 if AWS_SERVER:
-    if check_aws(AWS_SERVER):
-        st.success("⚡ Connected to AWS GPU server — fast transcription active")
-    else:
-        st.warning("⚠️ AWS server not reachable — using local CPU (slower)")
-        AWS_SERVER = None
+    st.success("⚡ Connected to AWS GPU server")
 else:
     st.info("ℹ️ Using local CPU — transcription takes 1-2 minutes per file")
 
 st.subheader("Upload a file")
-st.caption("Supported: WAV · FLAC · OGG · MP3 · M4A · AAC · MP4 · MOV · AVI · MKV · WEBM · OPUS")
+st.caption("WAV · FLAC · OGG · MP3 · M4A · AAC · MP4 · MOV · AVI · MKV · WEBM · OPUS")
 
 uploaded_file = st.file_uploader(
     "Choose an audio or video file",
     type=SUPPORTED_TYPES,
-    help="Any audio or video file containing Shona speech"
 )
 
 if uploaded_file is not None:
@@ -151,56 +160,104 @@ if uploaded_file is not None:
 
     if suffix in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
         st.video(uploaded_file)
-        st.caption("Video uploaded — will extract and transcribe the audio track")
     else:
         st.audio(uploaded_file)
 
     if st.button("🎙 Transcribe", type="primary", use_container_width=True):
-        try:
-            if AWS_SERVER:
-                with st.spinner("Transcribing on AWS GPU server..."):
-                    text = transcribe_aws(audio_bytes, AWS_SERVER, suffix)
-            else:
-                with st.spinner("Processing... this takes 1-2 minutes"):
-                    audio_array = get_audio_array(audio_bytes, suffix)
-                    text = transcribe_local(audio_array)
+        with st.spinner("Processing..."):
+            try:
+                audio_array = get_audio_array(audio_bytes, suffix)
+                text = transcribe_local(audio_array)
+                st.session_state["transcript"] = text
+                st.session_state["audio_bytes"] = audio_bytes
+                st.session_state["suffix"] = suffix
+                st.session_state["filename"] = uploaded_file.name
+            except Exception as e:
+                st.error(f"Could not process file: {str(e)}")
 
-            if text:
-                st.success("Transcription complete!")
-                st.text_area("Shona Transcript", value=text, height=200)
-                col1, col2 = st.columns(2)
-                base_name = uploaded_file.name.rsplit(".", 1)[0]
-                with col1:
-                    st.download_button(
-                        label="📄 Download as .txt",
-                        data=text,
-                        file_name=base_name + "_transcript.txt",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
-                with col2:
-                    srt = f"1\n00:00:00,000 --> 00:05:00,000\n{text}\n"
-                    st.download_button(
-                        label="🎬 Download as .srt (subtitles)",
-                        data=srt,
-                        file_name=base_name + ".srt",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
-            else:
-                st.warning("No speech detected. Try a clearer recording.")
+# Show transcript and feedback section
+if "transcript" in st.session_state and st.session_state["transcript"]:
+    text = st.session_state["transcript"]
 
-        except Exception as e:
-            st.error(f"Could not process file: {str(e)}")
-            st.info("Try converting your file to WAV using a free online converter, then upload again.")
+    st.success("Transcription complete!")
+    st.subheader("Transcript")
+
+    # Editable text area — user can correct mistakes
+    corrected = st.text_area(
+        "Review and correct the transcript if needed:",
+        value=text,
+        height=200,
+        help="Edit any mistakes you see. Your corrections help train the next version."
+    )
+
+    # Download buttons
+    col1, col2 = st.columns(2)
+    base_name = st.session_state["filename"].rsplit(".", 1)[0]
+    with col1:
+        st.download_button(
+            label="📄 Download as .txt",
+            data=corrected,
+            file_name=base_name + "_transcript.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+    with col2:
+        srt = f"1\n00:00:00,000 --> 00:05:00,000\n{corrected}\n"
+        st.download_button(
+            label="🎬 Download as .srt",
+            data=srt,
+            file_name=base_name + ".srt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # Feedback section
+    st.subheader("Help improve the model")
+    st.markdown("""
+    Did you correct any mistakes above? Submit your correction to help train
+    a more accurate Shona model. Your audio and corrected text will be saved
+    as open training data for the next version.
+    """)
+
+    accuracy = st.radio(
+        "How accurate was the original transcription?",
+        ["Excellent — no corrections needed",
+         "Good — minor corrections",
+         "Fair — several corrections",
+         "Poor — many corrections"],
+        horizontal=True,
+    )
+
+    if st.button("✅ Submit correction", type="secondary", use_container_width=True):
+        with st.spinner("Saving your contribution..."):
+            saved = save_correction(
+                audio_bytes=st.session_state["audio_bytes"],
+                suffix=st.session_state["suffix"],
+                original_text=text,
+                corrected_text=corrected,
+                filename=st.session_state["filename"],
+            )
+        if saved:
+            st.success(
+                "Tatenda! Your correction has been saved. "
+                "Every contribution makes the next Shona model more accurate."
+            )
+        else:
+            st.info(
+                "Correction could not be saved automatically, but you can "
+                "contribute directly at: github.com/stanleymateta-tech/Project-Nyaradzai"
+            )
 
 st.divider()
 st.markdown("""
-### Tips for best results:
-- Any audio or video format is supported
-- Speak clearly at normal pace
-- Reduce background noise where possible
-- Longer files take more time on CPU
+### How the feedback loop works:
+1. You upload Shona audio → model transcribes it
+2. You correct any mistakes in the text box above
+3. Submit → your corrected audio+text saves as training data
+4. We periodically retrain the model on all corrections
+5. The model gets more accurate on Zimbabwean speech over time
 
 ### About:
 - GitHub: [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai)
