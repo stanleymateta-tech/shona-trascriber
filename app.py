@@ -3,15 +3,15 @@ import warnings
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="Project Nyaradzai — Shona Transcriber",
+    page_title="Rurimi RwaAmai — Shona Language Services",
     page_icon="🎙",
     layout="centered"
 )
 
-st.title("🎙 Project Nyaradzai — Shona Transcriber 🇿🇼")
+st.title("🎙 Rurimi RwaAmai 🇿🇼")
 st.markdown("""
-**The first open Shona speech transcription tool — now with speaker detection.**
-Upload audio or video. Get a Shona transcript with each speaker labelled.
+**Mother Tongue — AI-powered Shona language services.**
+Transcribe speech. Read text aloud. All in chiShona.
 
 Part of [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai) —
 *Mutauro wedu, panyika yose* 🇿🇼
@@ -19,21 +19,19 @@ Part of [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyarad
 
 st.divider()
 
-HF_TOKEN  = st.secrets.get("HF_TOKEN", None)
-AWS_SERVER = None
+# ── Tab layout ────────────────────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["🎤 Transcribe (Speech → Text)", "🔊 Read Aloud (Text → Speech)"])
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
 SUPPORTED_TYPES = [
     "wav","flac","ogg","mp3","m4a","mp4","mov","avi","mkv","webm","aac","opus"
 ]
 
-# ── audio extraction ──────────────────────────────────────────────────────────
-def get_audio_array_and_wav(audio_bytes, suffix):
-    """Return (numpy array, wav_path) — wav file needed for diarisation."""
+def get_audio_array(audio_bytes, suffix):
     import numpy as np, tempfile, os, soundfile as sf
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(audio_bytes); tmp_in = f.name
     tmp_wav = tempfile.mktemp(suffix=".wav")
-
     try:
         import subprocess
         subprocess.run(
@@ -41,118 +39,27 @@ def get_audio_array_and_wav(audio_bytes, suffix):
             capture_output=True)
         if os.path.exists(tmp_wav):
             arr, _ = sf.read(tmp_wav)
-            return arr.astype(np.float32), tmp_wav
-    except Exception:
-        pass
-
-    try:
+            if len(arr.shape) > 1: arr = arr.mean(axis=1)
+            return arr.astype("float32")
         arr, sr = sf.read(tmp_in)
         if len(arr.shape) > 1: arr = arr.mean(axis=1)
         if sr != 16000:
             import librosa
-            arr = librosa.resample(arr.astype(np.float32), orig_sr=sr, target_sr=16000)
-        sf.write(tmp_wav, arr, 16000)
-        return arr.astype(np.float32), tmp_wav
+            arr = librosa.resample(arr.astype("float32"), orig_sr=sr, target_sr=16000)
+        return arr.astype("float32")
     finally:
-        try: os.unlink(tmp_in)
-        except: pass
+        for p in [tmp_in, tmp_wav]:
+            try:
+                if os.path.exists(p): os.unlink(p)
+            except: pass
 
-# ── noise suppression ─────────────────────────────────────────────────────────
-def suppress_noise(audio_array):
-    """Basic spectral noise gate using noisereduce."""
-    try:
-        import noisereduce as nr
-        return nr.reduce_noise(y=audio_array, sr=16000, stationary=False)
-    except Exception:
-        return audio_array   # return original if noisereduce not available
-
-# ── speaker diarisation ───────────────────────────────────────────────────────
-def diarise(wav_path, token):
-    """
-    Run pyannote speaker diarisation.
-    Returns list of (start, end, speaker_label) tuples.
-    """
-    try:
-        from pyannote.audio import Pipeline
-        import torch
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-community-1",
-            token=token)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        pipeline.to(device)
-        output = pipeline(wav_path)
-        segments = []
-        for turn, _, speaker in output.itertracks(yield_label=True):
-            segments.append((turn.start, turn.end, speaker))
-        return segments
-    except Exception as e:
-        return None
-
-# ── transcription ─────────────────────────────────────────────────────────────
-def transcribe_segment(asr, audio_array, start, end, sr=16000):
-    """Transcribe a specific time segment."""
-    s = int(start * sr)
-    e = int(end   * sr)
-    segment = audio_array[s:e]
-    if len(segment) < 1600:   # less than 0.1s — skip
-        return ""
-    try:
-        result = asr(segment.astype(float),
-                     generate_kwargs={"language":"shona","task":"transcribe"})
-        return result["text"].strip()
-    except Exception:
-        return ""
-
-def transcribe_full(audio_array):
-    """Transcribe the whole file at once."""
-    import transformers
-    transformers.logging.set_verbosity_error()
-    from transformers import pipeline
-    asr = pipeline("automatic-speech-recognition",
-                   model="Starsm91/whisper-small-shona",
-                   generate_kwargs={"language":"shona","task":"transcribe"})
-    result = asr(audio_array, return_timestamps=True,
-                 generate_kwargs={"language":"shona","task":"transcribe"})
-    return result["text"].strip()
-
-def transcribe_with_speakers(audio_array, segments):
-    """Transcribe each speaker segment separately."""
-    import transformers
-    transformers.logging.set_verbosity_error()
-    from transformers import pipeline
-    asr = pipeline("automatic-speech-recognition",
-                   model="Starsm91/whisper-small-shona",
-                   generate_kwargs={"language":"shona","task":"transcribe"})
-    lines = []
-    for start, end, speaker in segments:
-        text = transcribe_segment(asr, audio_array, start, end)
-        if text:
-            mins  = int(start // 60)
-            secs  = int(start % 60)
-            label = speaker.replace("SPEAKER_","Speaker ")
-            lines.append(f"[{mins:02d}:{secs:02d}] {label}: {text}")
-    return "\n\n".join(lines)
-
-def make_srt(segments_with_text):
-    """Generate SRT subtitle file from speaker segments."""
-    srt = []
-    for i, (start, end, speaker, text) in enumerate(segments_with_text, 1):
-        def fmt(t):
-            h=int(t//3600); m=int((t%3600)//60); s=int(t%60); ms=int((t%1)*1000)
-            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-        label = speaker.replace("SPEAKER_","Speaker ")
-        srt.append(f"{i}\n{fmt(start)} --> {fmt(end)}\n[{label}] {text}\n")
-    return "\n".join(srt)
-
-# ── feedback storage ──────────────────────────────────────────────────────────
-def save_correction(audio_bytes, suffix, original_text, corrected_text, filename):
+def save_correction(audio_bytes, suffix, original, corrected, filename):
     try:
         from huggingface_hub import HfApi
         import tempfile, os, json
         from datetime import datetime
-        api   = HfApi()
-        ts    = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-        rid   = "Starsm91/shona-corrections"
+        api = HfApi(); ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        rid = "Starsm91/shona-corrections"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             f.write(audio_bytes); tmp = f.name
         api.upload_file(path_or_fileobj=tmp,
@@ -160,155 +67,210 @@ def save_correction(audio_bytes, suffix, original_text, corrected_text, filename
                         repo_id=rid, repo_type="dataset")
         os.unlink(tmp)
         meta = json.dumps({"timestamp":ts,"filename":filename,
-                           "original":original_text,"corrected":corrected_text},
+                           "original":original,"corrected":corrected},
                           ensure_ascii=False)
         api.upload_file(path_or_fileobj=meta.encode(),
                         path_in_repo=f"corrections/{ts}.json",
                         repo_id=rid, repo_type="dataset")
         return True
-    except Exception as e:
-        return False
+    except: return False
 
-# ── sidebar options ───────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Options")
-    use_diarisation = st.toggle(
-        "👥 Identify speakers",
-        value=False,
-        help="Label who spoke when. Requires a Hugging Face token with pyannote access."
-    )
-    use_noise_reduction = st.toggle(
-        "🔇 Reduce background noise",
-        value=True,
-        help="Filter out background noise before transcribing."
-    )
-    if use_diarisation:
-        if HF_TOKEN:
-            st.success("Hugging Face token found")
+# ── TAB 1: TRANSCRIPTION ─────────────────────────────────────────────────────
+with tab1:
+    st.subheader("Upload audio or video → get Shona transcript")
+    st.caption("WAV · FLAC · OGG · MP3 · M4A · MP4 · MOV · AVI · MKV · WEBM · OPUS")
+
+    with st.sidebar:
+        st.header("⚙️ Options")
+        use_diarisation = st.toggle("👥 Identify speakers", value=False)
+        use_noise = st.toggle("🔇 Reduce background noise", value=True)
+        HF_TOKEN = st.secrets.get("HF_TOKEN", None)
+        if use_diarisation and not HF_TOKEN:
+            HF_TOKEN = st.text_input("Hugging Face token", type="password")
+        st.divider()
+        st.markdown("[Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai)")
+        st.markdown("[Shona ASR Model](https://huggingface.co/Starsm91/whisper-small-shona)")
+        st.markdown("[Shona TTS Model](https://huggingface.co/facebook/mms-tts-sna)")
+
+    uploaded = st.file_uploader("Choose a file", type=SUPPORTED_TYPES, key="asr_upload")
+
+    if uploaded:
+        suffix = "." + uploaded.name.split(".")[-1].lower()
+        audio_bytes = uploaded.read()
+        if suffix in [".mp4",".mov",".avi",".mkv",".webm"]:
+            st.video(uploaded)
         else:
-            user_token = st.text_input(
-                "Hugging Face token (for speaker ID)",
-                type="password",
-                help="Get a Write token from huggingface.co/settings/tokens. "
-                     "You must also accept terms at "
-                     "hf.co/pyannote/speaker-diarization-community-1"
-            )
-            if user_token:
-                HF_TOKEN = user_token
+            st.audio(uploaded)
 
-    st.divider()
-    st.markdown("**About:**")
-    st.markdown("[Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai)")
-    st.markdown("[Shona ASR Model](https://huggingface.co/Starsm91/whisper-small-shona)")
+        if st.button("🎙 Transcribe", type="primary", use_container_width=True):
+            import transformers, numpy as np
+            transformers.logging.set_verbosity_error()
+            from transformers import pipeline
 
-# ── main UI ───────────────────────────────────────────────────────────────────
-st.subheader("Upload a file")
-st.caption("WAV · FLAC · OGG · MP3 · M4A · AAC · MP4 · MOV · AVI · MKV · WEBM · OPUS")
+            with st.spinner("Extracting audio..."):
+                audio_array = get_audio_array(audio_bytes, suffix)
 
-uploaded_file = st.file_uploader(
-    "Choose an audio or video file", type=SUPPORTED_TYPES)
+            if use_noise:
+                with st.spinner("Reducing background noise..."):
+                    try:
+                        import noisereduce as nr
+                        audio_array = nr.reduce_noise(y=audio_array, sr=16000)
+                    except: pass
 
-if uploaded_file is not None:
-    suffix     = "." + uploaded_file.name.split(".")[-1].lower()
-    audio_bytes = uploaded_file.read()
+            transcript = ""
+            if use_diarisation and HF_TOKEN:
+                with st.spinner("Identifying speakers..."):
+                    try:
+                        import tempfile, soundfile as sf
+                        from pyannote.audio import Pipeline
+                        import torch
+                        tmp_wav = tempfile.mktemp(suffix=".wav")
+                        sf.write(tmp_wav, audio_array, 16000)
+                        pp = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-community-1", token=HF_TOKEN)
+                        output = pp(tmp_wav)
+                        segments = [(t.start,t.end,s)
+                                    for t,_,s in output.itertracks(yield_label=True)]
+                        asr = pipeline("automatic-speech-recognition",
+                                       model="Starsm91/whisper-small-shona",
+                                       generate_kwargs={"language":"shona","task":"transcribe"})
+                        lines = []
+                        for start,end,spk in segments:
+                            s=int(start*16000); e=int(end*16000)
+                            seg=audio_array[s:e]
+                            if len(seg)<1600: continue
+                            txt=asr(seg.astype(float),
+                                    generate_kwargs={"language":"shona","task":"transcribe"})["text"].strip()
+                            if txt:
+                                lines.append(f"[{int(start//60):02d}:{int(start%60):02d}] "
+                                             f"{spk.replace('SPEAKER_','Speaker ')}: {txt}")
+                        transcript = "\n\n".join(lines)
+                        import os; os.unlink(tmp_wav)
+                    except Exception as e:
+                        st.warning(f"Speaker ID failed: {e} — transcribing without labels")
 
-    if suffix in [".mp4",".mov",".avi",".mkv",".webm"]:
-        st.video(uploaded_file)
-    else:
-        st.audio(uploaded_file)
+            if not transcript:
+                with st.spinner("Transcribing Shona... (1-2 minutes)"):
+                    asr = pipeline("automatic-speech-recognition",
+                                   model="Starsm91/whisper-small-shona",
+                                   generate_kwargs={"language":"shona","task":"transcribe"})
+                    transcript = asr(audio_array, return_timestamps=True,
+                                     generate_kwargs={"language":"shona","task":"transcribe"})["text"].strip()
 
-    if st.button("🎙 Transcribe", type="primary", use_container_width=True):
-        import os
+            st.session_state["transcript"]  = transcript
+            st.session_state["audio_bytes"] = audio_bytes
+            st.session_state["suffix"]      = suffix
+            st.session_state["filename"]    = uploaded.name
 
-        with st.spinner("Extracting audio..."):
-            audio_array, wav_path = get_audio_array_and_wav(audio_bytes, suffix)
+    if st.session_state.get("transcript"):
+        transcript = st.session_state["transcript"]
+        st.success("Transcription complete!")
+        corrected = st.text_area("Review and correct if needed:",
+                                  value=transcript, height=200)
+        base = st.session_state["filename"].rsplit(".",1)[0]
+        col1,col2 = st.columns(2)
+        with col1:
+            st.download_button("📄 Download .txt", data=corrected,
+                               file_name=base+"_transcript.txt",
+                               mime="text/plain", use_container_width=True)
+        with col2:
+            srt = f"1\n00:00:00,000 --> 00:05:00,000\n{corrected}\n"
+            st.download_button("🎬 Download .srt", data=srt,
+                               file_name=base+".srt",
+                               mime="text/plain", use_container_width=True)
+        st.divider()
+        st.subheader("Help improve the model")
+        st.markdown("Correct any mistakes above then submit to help train a better Shona model.")
+        if st.button("✅ Submit correction", use_container_width=True):
+            with st.spinner("Saving..."):
+                saved = save_correction(st.session_state["audio_bytes"],
+                                        st.session_state["suffix"],
+                                        transcript, corrected,
+                                        st.session_state["filename"])
+            st.success("Tatenda! Saved as training data.") if saved else \
+            st.info("Contribute at github.com/stanleymateta-tech/Project-Nyaradzai")
 
-        if use_noise_reduction:
-            with st.spinner("Reducing background noise..."):
-                audio_array = suppress_noise(audio_array)
+# ── TAB 2: TEXT TO SPEECH ─────────────────────────────────────────────────────
+with tab2:
+    st.subheader("Type Shona text → hear it spoken aloud")
+    st.markdown("""
+    Powered by Meta's MMS-TTS Shona voice model.
+    Type any Shona text — a sentence, a paragraph, a novel passage — and download the audio.
+    """)
 
-        transcript = ""
-        segments_with_text = []
-
-        if use_diarisation and HF_TOKEN:
-            with st.spinner("Identifying speakers... (this takes a minute)"):
-                segments = diarise(wav_path, HF_TOKEN)
-
-            if segments:
-                with st.spinner("Transcribing each speaker..."):
-                    transcript = transcribe_with_speakers(audio_array, segments)
-                    # also build segments_with_text for SRT
-                    import transformers
-                    transformers.logging.set_verbosity_error()
-                    from transformers import pipeline as hf_pipeline
-                    asr = hf_pipeline("automatic-speech-recognition",
-                                      model="Starsm91/whisper-small-shona",
-                                      generate_kwargs={"language":"shona","task":"transcribe"})
-                    for start, end, speaker in segments:
-                        text = transcribe_segment(asr, audio_array, start, end)
-                        if text:
-                            segments_with_text.append((start, end, speaker, text))
-            else:
-                st.warning("Speaker identification failed — transcribing without speaker labels.")
-                with st.spinner("Transcribing..."):
-                    transcript = transcribe_full(audio_array)
-        else:
-            with st.spinner("Transcribing Shona... (1-2 minutes)"):
-                transcript = transcribe_full(audio_array)
-
-        try:
-            if wav_path and os.path.exists(wav_path):
-                os.unlink(wav_path)
-        except Exception:
-            pass
-
-        st.session_state["transcript"]  = transcript
-        st.session_state["audio_bytes"] = audio_bytes
-        st.session_state["suffix"]      = suffix
-        st.session_state["filename"]    = uploaded_file.name
-        st.session_state["srt_data"]    = make_srt(segments_with_text) if segments_with_text else None
-
-# ── results ───────────────────────────────────────────────────────────────────
-if st.session_state.get("transcript"):
-    transcript = st.session_state["transcript"]
-    st.success("Transcription complete!")
-    st.subheader("Transcript")
-
-    corrected = st.text_area(
-        "Review and correct the transcript if needed:",
-        value=transcript, height=250,
-        help="Edit mistakes — your corrections help train the next version")
+    shona_text = st.text_area(
+        "Enter Shona text:",
+        placeholder="Mangwanani. Ndinotenda chaizvo nerubatsiro rwenyu. "
+                    "Rurimi rwedu nderwedu tose...",
+        height=200,
+        help="Type or paste any Shona text. Longer text takes more time to process."
+    )
 
     col1, col2 = st.columns(2)
-    base = st.session_state["filename"].rsplit(".",1)[0]
     with col1:
-        st.download_button("📄 Download .txt", data=corrected,
-                           file_name=base+"_transcript.txt",
-                           mime="text/plain", use_container_width=True)
+        speed = st.slider("Speaking speed", min_value=0.5, max_value=2.0,
+                          value=1.0, step=0.1,
+                          help="1.0 is normal speed")
     with col2:
-        srt_data = st.session_state.get("srt_data") or \
-                   f"1\n00:00:00,000 --> 00:05:00,000\n{corrected}\n"
-        st.download_button("🎬 Download .srt", data=srt_data,
-                           file_name=base+".srt",
-                           mime="text/plain", use_container_width=True)
+        st.markdown("**Voice:** Shona (Meta MMS-TTS)")
+        st.markdown("**Model:** facebook/mms-tts-sna")
+
+    if st.button("🔊 Read Aloud", type="primary",
+                 use_container_width=True, disabled=not shona_text.strip()):
+        with st.spinner("Generating Shona audio..."):
+            try:
+                import transformers, numpy as np, io
+                transformers.logging.set_verbosity_error()
+                from transformers import pipeline
+                import soundfile as sf
+
+                tts = pipeline("text-to-speech", model="facebook/mms-tts-sna")
+                result = tts(shona_text.strip())
+
+                audio = np.array(result["audio"]).squeeze()
+                sr    = result["sampling_rate"]
+
+                # Apply speed adjustment
+                if speed != 1.0:
+                    import librosa
+                    audio = librosa.effects.time_stretch(audio, rate=speed)
+
+                # Save to buffer
+                buf = io.BytesIO()
+                sf.write(buf, audio, sr, format="WAV")
+                buf.seek(0)
+                audio_bytes_out = buf.read()
+
+                st.success("Audio generated!")
+                st.audio(audio_bytes_out, format="audio/wav")
+
+                st.download_button(
+                    label="⬇️ Download audio (.wav)",
+                    data=audio_bytes_out,
+                    file_name="shona_audio.wav",
+                    mime="audio/wav",
+                    use_container_width=True
+                )
+
+                # Show word count and duration info
+                word_count = len(shona_text.split())
+                duration   = len(audio) / sr
+                st.caption(f"{word_count} words · {duration:.1f} seconds of audio")
+
+            except Exception as e:
+                st.error(f"Could not generate audio: {str(e)}")
+                st.info("Try shorter text if you get a timeout error.")
 
     st.divider()
-    st.subheader("Help improve the model")
-    st.markdown("Did you correct any mistakes? Submit to help train a better Shona model.")
+    st.markdown("""
+    ### Use cases:
+    - **Audiobooks** — paste a chapter from a Shona novel and download the audio
+    - **Church** — generate audio versions of written sermons or announcements
+    - **Education** — reading tools for Shona literacy
+    - **Accessibility** — for visually impaired Shona speakers
+    - **Content creation** — Shona voiceovers for videos
 
-    accuracy = st.radio("How accurate was the transcription?",
-                        ["Excellent","Good — minor corrections",
-                         "Fair — several corrections","Poor"],
-                        horizontal=True)
-
-    if st.button("✅ Submit correction", use_container_width=True):
-        with st.spinner("Saving..."):
-            saved = save_correction(
-                st.session_state["audio_bytes"],
-                st.session_state["suffix"],
-                transcript, corrected,
-                st.session_state["filename"])
-        if saved:
-            st.success("Tatenda! Your correction has been saved as training data.")
-        else:
-            st.info("Contribute at: github.com/stanleymateta-tech/Project-Nyaradzai")
+    ### About the voice:
+    Powered by [Meta's MMS-TTS](https://huggingface.co/facebook/mms-tts-sna) Shona model,
+    part of the Massively Multilingual Speech project covering 1,100+ languages.
+    """)
