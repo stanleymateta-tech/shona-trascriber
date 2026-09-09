@@ -31,20 +31,49 @@ def get_audio_array(audio_bytes, suffix):
         f.write(audio_bytes); tmp_in = f.name
     tmp_wav = tempfile.mktemp(suffix=".wav")
     try:
-        import subprocess, shutil
-        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
-        result = subprocess.run([ffmpeg_path,"-y","-i",tmp_in,"-ar","16000","-ac","1",
-                        "-f","wav",tmp_wav], capture_output=True)
-        if result.returncode == 0 and os.path.exists(tmp_wav):
-            arr, _ = sf.read(tmp_wav)
+        # Try soundfile directly first (WAV, FLAC, OGG)
+        try:
+            arr, sr = sf.read(tmp_in)
             if len(arr.shape) > 1: arr = arr.mean(axis=1)
+            if sr != 16000:
+                import librosa
+                arr = librosa.resample(arr.astype("float32"), orig_sr=sr, target_sr=16000)
             return arr.astype("float32")
-        arr, sr = sf.read(tmp_in)
-        if len(arr.shape) > 1: arr = arr.mean(axis=1)
-        if sr != 16000:
+        except Exception:
+            pass
+
+        # Try librosa which handles MP3 and M4A
+        try:
             import librosa
-            arr = librosa.resample(arr.astype("float32"), orig_sr=sr, target_sr=16000)
-        return arr.astype("float32")
+            arr, _ = librosa.load(tmp_in, sr=16000, mono=True)
+            return arr.astype("float32")
+        except Exception:
+            pass
+
+        # Try pydub as last resort
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_file(tmp_in)
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            arr = np.array(audio.get_array_of_samples(), dtype=np.float32)
+            arr /= np.iinfo(audio.array_type).max
+            return arr
+        except Exception:
+            pass
+
+        # Try ffmpeg if available
+        import subprocess, shutil
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            result = subprocess.run([ffmpeg_path,"-y","-i",tmp_in,
+                            "-ar","16000","-ac","1","-f","wav",tmp_wav],
+                            capture_output=True)
+            if result.returncode == 0 and os.path.exists(tmp_wav):
+                arr, _ = sf.read(tmp_wav)
+                if len(arr.shape) > 1: arr = arr.mean(axis=1)
+                return arr.astype("float32")
+
+        raise ValueError("Could not decode audio file. Try WAV or FLAC format.")
     finally:
         for p in [tmp_in, tmp_wav]:
             try:
