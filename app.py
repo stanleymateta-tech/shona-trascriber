@@ -31,10 +31,11 @@ def get_audio_array(audio_bytes, suffix):
         f.write(audio_bytes); tmp_in = f.name
     tmp_wav = tempfile.mktemp(suffix=".wav")
     try:
-        import subprocess
-        subprocess.run(["ffmpeg","-y","-i",tmp_in,"-ar","16000","-ac","1",
+        import subprocess, shutil
+        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        result = subprocess.run([ffmpeg_path,"-y","-i",tmp_in,"-ar","16000","-ac","1",
                         "-f","wav",tmp_wav], capture_output=True)
-        if os.path.exists(tmp_wav):
+        if result.returncode == 0 and os.path.exists(tmp_wav):
             arr, _ = sf.read(tmp_wav)
             if len(arr.shape) > 1: arr = arr.mean(axis=1)
             return arr.astype("float32")
