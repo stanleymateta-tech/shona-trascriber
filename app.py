@@ -50,7 +50,7 @@ def get_audio_array(audio_bytes, suffix):
         except Exception:
             pass
 
-        # Try pydub as last resort
+        # Try pydub
         try:
             from pydub import AudioSegment
             audio = AudioSegment.from_file(tmp_in)
@@ -58,6 +58,23 @@ def get_audio_array(audio_bytes, suffix):
             arr = np.array(audio.get_array_of_samples(), dtype=np.float32)
             arr /= np.iinfo(audio.array_type).max
             return arr
+        except Exception:
+            pass
+
+        # Try av (PyAV) for M4A and other formats
+        try:
+            import av
+            container = av.open(tmp_in)
+            samples = []
+            resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
+            for frame in container.decode(audio=0):
+                frame.pts = None
+                resampled = resampler.resample(frame)
+                for r in resampled:
+                    samples.append(r.to_ndarray().flatten())
+            if samples:
+                arr = np.concatenate(samples).astype(np.float32)
+                return arr
         except Exception:
             pass
 
@@ -73,7 +90,12 @@ def get_audio_array(audio_bytes, suffix):
                 if len(arr.shape) > 1: arr = arr.mean(axis=1)
                 return arr.astype("float32")
 
-        raise ValueError("Could not decode audio file. Try WAV or FLAC format.")
+        raise ValueError(
+            f"Could not decode {suffix} file. "
+            "Please convert to WAV format first. "
+            "On Mac: open in QuickTime → File → Export As → Audio Only → saves as M4A, "
+            "then use: ffmpeg -i input.m4a output.wav"
+        )
     finally:
         for p in [tmp_in, tmp_wav]:
             try:
