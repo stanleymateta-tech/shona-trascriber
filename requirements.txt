@@ -8,3 +8,4 @@ noisereduce
 pyannote.audio
 ffmpeg-python
 pydub
+av
