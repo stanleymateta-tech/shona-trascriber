@@ -7,3 +7,4 @@ librosa
 noisereduce
 pyannote.audio
 ffmpeg-python
+pydub
