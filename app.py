@@ -31,7 +31,6 @@ def get_audio_array(audio_bytes, suffix):
         f.write(audio_bytes); tmp_in = f.name
     tmp_wav = tempfile.mktemp(suffix=".wav")
     try:
-        # Try soundfile directly first (WAV, FLAC, OGG)
         try:
             arr, sr = sf.read(tmp_in)
             if len(arr.shape) > 1: arr = arr.mean(axis=1)
@@ -41,16 +40,12 @@ def get_audio_array(audio_bytes, suffix):
             return arr.astype("float32")
         except Exception:
             pass
-
-        # Try librosa which handles MP3 and M4A
         try:
             import librosa
             arr, _ = librosa.load(tmp_in, sr=16000, mono=True)
             return arr.astype("float32")
         except Exception:
             pass
-
-        # Try pydub
         try:
             from pydub import AudioSegment
             audio = AudioSegment.from_file(tmp_in)
@@ -60,8 +55,6 @@ def get_audio_array(audio_bytes, suffix):
             return arr
         except Exception:
             pass
-
-        # Try av (PyAV) for M4A and other formats
         try:
             import av
             container = av.open(tmp_in)
@@ -73,12 +66,9 @@ def get_audio_array(audio_bytes, suffix):
                 for r in resampled:
                     samples.append(r.to_ndarray().flatten())
             if samples:
-                arr = np.concatenate(samples).astype(np.float32)
-                return arr
+                return np.concatenate(samples).astype(np.float32)
         except Exception:
             pass
-
-        # Try ffmpeg if available
         import subprocess, shutil
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path:
@@ -89,44 +79,136 @@ def get_audio_array(audio_bytes, suffix):
                 arr, _ = sf.read(tmp_wav)
                 if len(arr.shape) > 1: arr = arr.mean(axis=1)
                 return arr.astype("float32")
-
-        raise ValueError(
-            f"Could not decode {suffix} file. "
-            "Please convert to WAV format first. "
-            "On Mac: open in QuickTime → File → Export As → Audio Only → saves as M4A, "
-            "then use: ffmpeg -i input.m4a output.wav"
-        )
+        raise ValueError(f"Could not decode {suffix} file. Try WAV or FLAC format.")
     finally:
         for p in [tmp_in, tmp_wav]:
             try:
                 if os.path.exists(p): os.unlink(p)
             except: pass
 
+def format_timestamp(seconds):
+    """Convert seconds to HH:MM:SS format."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def format_srt_timestamp(seconds):
+    """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def build_timestamped_transcript(chunks):
+    """Build a readable timestamped transcript from Whisper chunks."""
+    lines = []
+    for chunk in chunks:
+        if not chunk.get("text","").strip():
+            continue
+        start = chunk.get("timestamp", [0, 0])[0] or 0
+        text  = chunk["text"].strip()
+        lines.append(f"[{format_timestamp(start)}] {text}")
+    return "\n".join(lines)
+
+def build_srt(chunks):
+    """Build proper SRT subtitle file from Whisper timestamp chunks."""
+    srt_lines = []
+    idx = 1
+    for chunk in chunks:
+        text = chunk.get("text","").strip()
+        if not text:
+            continue
+        ts   = chunk.get("timestamp", [0, 1])
+        start = ts[0] if ts[0] is not None else 0
+        end   = ts[1] if ts[1] is not None else start + 3
+        srt_lines.append(
+            f"{idx}\n"
+            f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n"
+            f"{text}\n"
+        )
+        idx += 1
+    return "\n".join(srt_lines)
+
+def send_transcript_email(to_email, filename, transcript, srt_content):
+    """Send transcript by email using SMTP."""
+    try:
+        import smtplib, ssl
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.base import MIMEBase
+        from email import encoders
+
+        # Get email credentials from Streamlit secrets
+        smtp_host  = st.secrets.get("SMTP_HOST", "smtp.gmail.com")
+        smtp_port  = int(st.secrets.get("SMTP_PORT", 587))
+        smtp_user  = st.secrets.get("SMTP_USER", "")
+        smtp_pass  = st.secrets.get("SMTP_PASS", "")
+
+        if not smtp_user or not smtp_pass:
+            return False, "Email not configured. Download your transcript using the buttons above."
+
+        msg = MIMEMultipart()
+        msg["From"]    = smtp_user
+        msg["To"]      = to_email
+        msg["Subject"] = f"Your Shona Transcript — {filename}"
+
+        body = f"""Tatenda — Thank you for using Rurimi RwaAmai!
+
+Your Shona transcript for '{filename}' is attached.
+
+Files attached:
+• {filename}_transcript.txt — Full transcript
+• {filename}.srt — Subtitle file for video editors
+
+---
+Rurimi RwaAmai — Mother Tongue
+AI-powered Shona language services
+shona-trascriber.streamlit.app
+*Mutauro wedu, panyika yose* 🇿🇼
+"""
+        msg.attach(MIMEText(body, "plain"))
+
+        # Attach transcript txt
+        txt_part = MIMEBase("application", "octet-stream")
+        txt_part.set_payload(transcript.encode("utf-8"))
+        encoders.encode_base64(txt_part)
+        txt_part.add_header("Content-Disposition",
+                            f"attachment; filename={filename}_transcript.txt")
+        msg.attach(txt_part)
+
+        # Attach SRT
+        srt_part = MIMEBase("application", "octet-stream")
+        srt_part.set_payload(srt_content.encode("utf-8"))
+        encoders.encode_base64(srt_part)
+        srt_part.add_header("Content-Disposition",
+                            f"attachment; filename={filename}.srt")
+        msg.attach(srt_part)
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+
+        return True, f"Transcript sent to {to_email}"
+    except Exception as e:
+        return False, f"Could not send email: {str(e)}"
+
 def translate_to_english(shona_text):
-    """Translate Shona text to English using Helsinki-NLP opus-mt-sn-en."""
     try:
         import transformers
         transformers.logging.set_verbosity_error()
         from transformers import pipeline
-        translator = pipeline("translation",
-                              model="Helsinki-NLP/opus-mt-sn-en")
+        translator = pipeline("translation", model="Helsinki-NLP/opus-mt-sn-en")
         result = translator(shona_text, max_length=512)
         return result[0]["translation_text"]
     except Exception as e:
-        # Fallback: use Whisper translation mode
         return f"Translation error: {str(e)}"
-
-def whisper_translate(audio_array):
-    """Direct Shona speech to English using Whisper translation mode."""
-    import transformers
-    transformers.logging.set_verbosity_error()
-    from transformers import pipeline
-    asr = pipeline("automatic-speech-recognition",
-                   model="Starsm91/whisper-small-shona",
-                   generate_kwargs={"language": "shona", "task": "translate"})
-    result = asr(audio_array, return_timestamps=True,
-                 generate_kwargs={"language": "shona", "task": "translate"})
-    return result["text"].strip()
 
 def save_correction(audio_bytes, suffix, original, corrected, filename):
     try:
@@ -150,19 +232,23 @@ def save_correction(audio_bytes, suffix, original, corrected, filename):
         return True
     except: return False
 
-# ── TAB 1: TRANSCRIPTION + TRANSLATION ───────────────────────────────────────
+# ── TAB 1: TRANSCRIPTION ─────────────────────────────────────────────────────
 with tab1:
     with st.sidebar:
         st.header("⚙️ Options")
+        use_timestamps  = st.toggle("🕐 Include timestamps", value=False,
+                                    help="Show [MM:SS] timestamps next to each sentence")
+        use_noise       = st.toggle("🔇 Reduce background noise", value=True)
+        show_translation= st.toggle("🌍 Translate to English", value=False)
         use_diarisation = st.toggle("👥 Identify speakers", value=False)
-        use_noise = st.toggle("🔇 Reduce background noise", value=True)
-        show_translation = st.toggle("🌍 Translate to English", value=False)
-        direct_translate = st.toggle("⚡ Direct speech→English (faster)",
-                                     value=False,
-                                     help="Translates directly from audio without Shona text step")
         HF_TOKEN = st.secrets.get("HF_TOKEN", None)
         if use_diarisation and not HF_TOKEN:
             HF_TOKEN = st.text_input("Hugging Face token", type="password")
+        st.divider()
+        st.markdown("📧 **Email delivery**")
+        email_address = st.text_input("Send transcript to email",
+                                       placeholder="your@email.com",
+                                       help="Enter your email to receive the transcript when done")
         st.divider()
         st.markdown("[Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai)")
         st.markdown("[Shona ASR Model](https://huggingface.co/Starsm91/whisper-small-shona)")
@@ -173,7 +259,7 @@ with tab1:
     uploaded = st.file_uploader("Choose a file", type=SUPPORTED_TYPES, key="asr_upload")
 
     if uploaded:
-        suffix = "." + uploaded.name.split(".")[-1].lower()
+        suffix      = "." + uploaded.name.split(".")[-1].lower()
         audio_bytes = uploaded.read()
         if suffix in [".mp4",".mov",".avi",".mkv",".webm"]:
             st.video(uploaded)
@@ -185,101 +271,130 @@ with tab1:
             transformers.logging.set_verbosity_error()
             from transformers import pipeline
 
-            with st.spinner("Extracting audio..."):
+            progress = st.progress(0, text="Extracting audio...")
+            with st.spinner(""):
                 audio_array = get_audio_array(audio_bytes, suffix)
+            progress.progress(20, text="Audio extracted...")
 
             if use_noise:
-                with st.spinner("Reducing background noise..."):
-                    try:
-                        import noisereduce as nr
-                        audio_array = nr.reduce_noise(y=audio_array, sr=16000)
-                    except: pass
+                progress.progress(30, text="Reducing background noise...")
+                try:
+                    import noisereduce as nr
+                    audio_array = nr.reduce_noise(y=audio_array, sr=16000)
+                except: pass
 
-            # Direct speech-to-English translation
-            if direct_translate:
-                with st.spinner("Translating Shona speech to English directly..."):
-                    english_text = whisper_translate(audio_array)
-                st.session_state["transcript"] = ""
-                st.session_state["english"] = english_text
-                st.session_state["audio_bytes"] = audio_bytes
-                st.session_state["suffix"] = suffix
-                st.session_state["filename"] = uploaded.name
+            transcript   = ""
+            chunks       = []
+            srt_content  = ""
 
+            if use_diarisation and HF_TOKEN:
+                progress.progress(40, text="Identifying speakers...")
+                try:
+                    import tempfile, soundfile as sf
+                    from pyannote.audio import Pipeline as PyPipeline
+                    tmp_wav = tempfile.mktemp(suffix=".wav")
+                    sf.write(tmp_wav, audio_array, 16000)
+                    pp = PyPipeline.from_pretrained(
+                        "pyannote/speaker-diarization-community-1",
+                        token=HF_TOKEN)
+                    output = pp(tmp_wav)
+                    segments = [(t.start,t.end,s)
+                                for t,_,s in output.itertracks(yield_label=True)]
+                    asr = pipeline("automatic-speech-recognition",
+                                   model="Starsm91/whisper-small-shona",
+                                   generate_kwargs={"language":"shona","task":"transcribe"})
+                    lines = []
+                    for start,end,spk in segments:
+                        s=int(start*16000); e=int(end*16000)
+                        seg=audio_array[s:e]
+                        if len(seg)<1600: continue
+                        txt=asr(seg.astype(float),
+                                generate_kwargs={"language":"shona",
+                                                 "task":"transcribe"})["text"].strip()
+                        if txt:
+                            ts_str = f"[{format_timestamp(start)}] " if use_timestamps else ""
+                            spk_str = spk.replace("SPEAKER_","Speaker ")
+                            lines.append(f"{ts_str}{spk_str}: {txt}")
+                    transcript = "\n\n".join(lines)
+                    import os; os.unlink(tmp_wav)
+                except Exception as e:
+                    st.warning(f"Speaker ID failed: {e}")
+
+            progress.progress(50, text="Transcribing Shona speech...")
+            if not transcript:
+                asr = pipeline("automatic-speech-recognition",
+                               model="Starsm91/whisper-small-shona",
+                               generate_kwargs={"language":"shona","task":"transcribe"})
+                result = asr(audio_array, return_timestamps=True,
+                             generate_kwargs={"language":"shona","task":"transcribe"})
+                chunks = result.get("chunks", [])
+
+                if use_timestamps and chunks:
+                    transcript = build_timestamped_transcript(chunks)
+                else:
+                    transcript = result["text"].strip()
+
+            # Build SRT from chunks
+            if chunks:
+                srt_content = build_srt(chunks)
             else:
-                # Normal transcription
-                transcript = ""
-                if use_diarisation and HF_TOKEN:
-                    with st.spinner("Identifying speakers..."):
-                        try:
-                            import tempfile, soundfile as sf
-                            from pyannote.audio import Pipeline
-                            tmp_wav = tempfile.mktemp(suffix=".wav")
-                            sf.write(tmp_wav, audio_array, 16000)
-                            pp = Pipeline.from_pretrained(
-                                "pyannote/speaker-diarization-community-1",
-                                token=HF_TOKEN)
-                            output = pp(tmp_wav)
-                            segments = [(t.start,t.end,s)
-                                        for t,_,s in output.itertracks(yield_label=True)]
-                            asr = pipeline("automatic-speech-recognition",
-                                           model="Starsm91/whisper-small-shona",
-                                           generate_kwargs={"language":"shona","task":"transcribe"})
-                            lines = []
-                            for start,end,spk in segments:
-                                s=int(start*16000); e=int(end*16000)
-                                seg=audio_array[s:e]
-                                if len(seg)<1600: continue
-                                txt=asr(seg.astype(float),
-                                        generate_kwargs={"language":"shona",
-                                                         "task":"transcribe"})["text"].strip()
-                                if txt:
-                                    lines.append(
-                                        f"[{int(start//60):02d}:{int(start%60):02d}] "
-                                        f"{spk.replace('SPEAKER_','Speaker ')}: {txt}")
-                            transcript = "\n\n".join(lines)
-                            import os; os.unlink(tmp_wav)
-                        except Exception as e:
-                            st.warning(f"Speaker ID failed: {e}")
+                srt_content = f"1\n00:00:00,000 --> 00:05:00,000\n{transcript}\n"
 
-                if not transcript:
-                    with st.spinner("Transcribing Shona... (1-2 minutes)"):
-                        asr = pipeline("automatic-speech-recognition",
-                                       model="Starsm91/whisper-small-shona",
-                                       generate_kwargs={"language":"shona","task":"transcribe"})
-                        transcript = asr(audio_array, return_timestamps=True,
-                                         generate_kwargs={"language":"shona",
-                                                          "task":"transcribe"})["text"].strip()
+            progress.progress(80, text="Finishing up...")
 
-                # Translate if requested
-                english = ""
-                if show_translation and transcript:
-                    with st.spinner("Translating to English..."):
-                        english = translate_to_english(transcript)
+            # Translate if requested
+            english = ""
+            if show_translation and transcript:
+                progress.progress(85, text="Translating to English...")
+                english = translate_to_english(transcript)
 
-                st.session_state["transcript"]  = transcript
-                st.session_state["english"]     = english
-                st.session_state["audio_bytes"] = audio_bytes
-                st.session_state["suffix"]      = suffix
-                st.session_state["filename"]    = uploaded.name
+            # Send email if address provided
+            if email_address and email_address.strip():
+                progress.progress(90, text="Sending email...")
+                base = uploaded.name.rsplit(".",1)[0]
+                ok, msg = send_transcript_email(
+                    email_address.strip(), base, transcript, srt_content)
+                if ok:
+                    st.success(f"📧 {msg}")
+                else:
+                    st.info(f"📧 {msg}")
+
+            progress.progress(100, text="Done!")
+
+            st.session_state["transcript"]  = transcript
+            st.session_state["english"]     = english
+            st.session_state["audio_bytes"] = audio_bytes
+            st.session_state["suffix"]      = suffix
+            st.session_state["filename"]    = uploaded.name
+            st.session_state["srt_content"] = srt_content
+            st.session_state["chunks"]      = chunks
 
     # Show results
     if st.session_state.get("transcript") or st.session_state.get("english"):
-        transcript = st.session_state.get("transcript","")
-        english    = st.session_state.get("english","")
+        transcript  = st.session_state.get("transcript","")
+        english     = st.session_state.get("english","")
+        srt_content = st.session_state.get("srt_content","")
+        chunks      = st.session_state.get("chunks",[])
 
         if transcript:
             st.success("Transcription complete!")
+
+            # Word and character count
+            word_count = len(transcript.split())
+            char_count = len(transcript)
+            st.caption(f"{word_count:,} words · {char_count:,} characters")
+
             st.subheader("Shona Transcript")
             corrected = st.text_area("Review and correct if needed:",
-                                      value=transcript, height=180)
+                                      value=transcript, height=200)
 
-            # Show English translation
+            # Copy button
+            st.code(corrected, language=None)
+
             if english:
                 st.subheader("🌍 English Translation")
-                st.text_area("English:", value=english, height=120,
-                             key="eng_display")
+                st.text_area("English:", value=english, height=120, key="eng_display")
 
-            # If translation not yet done, offer button
             if transcript and not english:
                 if st.button("🌍 Translate to English", use_container_width=True):
                     with st.spinner("Translating..."):
@@ -287,25 +402,25 @@ with tab1:
                     st.session_state["english"] = eng
                     st.text_area("English Translation:", value=eng, height=120)
 
-        elif english:
-            st.success("Translation complete!")
-            st.subheader("🌍 English Translation (direct from speech)")
-            st.text_area("English:", value=english, height=200)
-            corrected = english
-
         base = st.session_state["filename"].rsplit(".",1)[0]
-        col1,col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
-            download_text = corrected if transcript else english
-            st.download_button("📄 Download .txt", data=download_text,
+            st.download_button("📄 Download .txt",
+                               data=corrected if transcript else english,
                                file_name=base+"_transcript.txt",
                                mime="text/plain", use_container_width=True)
         with col2:
-            srt_text = corrected if transcript else english
-            srt = f"1\n00:00:00,000 --> 00:05:00,000\n{srt_text}\n"
-            st.download_button("🎬 Download .srt", data=srt,
+            st.download_button("🎬 Download .srt",
+                               data=srt_content,
                                file_name=base+".srt",
                                mime="text/plain", use_container_width=True)
+        with col3:
+            if chunks:
+                ts_transcript = build_timestamped_transcript(chunks)
+                st.download_button("🕐 Download with timestamps",
+                                   data=ts_transcript,
+                                   file_name=base+"_timestamped.txt",
+                                   mime="text/plain", use_container_width=True)
 
         if transcript:
             st.divider()
