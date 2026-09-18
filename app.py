@@ -25,6 +25,7 @@ SUPPORTED_TYPES = [
     "wav","flac","ogg","mp3","m4a","mp4","mov","avi","mkv","webm","aac","opus"
 ]
 
+# ── Audio extraction ──────────────────────────────────────────────────────────
 def get_audio_array(audio_bytes, suffix):
     import numpy as np, tempfile, os, soundfile as sf
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -38,14 +39,12 @@ def get_audio_array(audio_bytes, suffix):
                 import librosa
                 arr = librosa.resample(arr.astype("float32"), orig_sr=sr, target_sr=16000)
             return arr.astype("float32")
-        except Exception:
-            pass
+        except Exception: pass
         try:
             import librosa
             arr, _ = librosa.load(tmp_in, sr=16000, mono=True)
             return arr.astype("float32")
-        except Exception:
-            pass
+        except Exception: pass
         try:
             from pydub import AudioSegment
             audio = AudioSegment.from_file(tmp_in)
@@ -53,8 +52,7 @@ def get_audio_array(audio_bytes, suffix):
             arr = np.array(audio.get_array_of_samples(), dtype=np.float32)
             arr /= np.iinfo(audio.array_type).max
             return arr
-        except Exception:
-            pass
+        except Exception: pass
         try:
             import av
             container = av.open(tmp_in)
@@ -63,12 +61,9 @@ def get_audio_array(audio_bytes, suffix):
             for frame in container.decode(audio=0):
                 frame.pts = None
                 resampled = resampler.resample(frame)
-                for r in resampled:
-                    samples.append(r.to_ndarray().flatten())
-            if samples:
-                return np.concatenate(samples).astype(np.float32)
-        except Exception:
-            pass
+                for r in resampled: samples.append(r.to_ndarray().flatten())
+            if samples: return np.concatenate(samples).astype(np.float32)
+        except Exception: pass
         import subprocess, shutil
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path:
@@ -86,55 +81,89 @@ def get_audio_array(audio_bytes, suffix):
                 if os.path.exists(p): os.unlink(p)
             except: pass
 
-def format_timestamp(seconds):
-    """Convert seconds to HH:MM:SS format."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+# ── Timestamp helpers ─────────────────────────────────────────────────────────
+def fmt_ts(s):
+    h=int(s//3600); m=int((s%3600)//60); sec=int(s%60)
+    return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
-def format_srt_timestamp(seconds):
-    """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def fmt_srt(s):
+    h=int(s//3600); m=int((s%3600)//60); sec=int(s%60); ms=int((s%1)*1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
-def build_timestamped_transcript(chunks):
-    """Build a readable timestamped transcript from Whisper chunks."""
+def build_timestamped(chunks):
     lines = []
-    for chunk in chunks:
-        if not chunk.get("text","").strip():
-            continue
-        start = chunk.get("timestamp", [0, 0])[0] or 0
-        text  = chunk["text"].strip()
-        lines.append(f"[{format_timestamp(start)}] {text}")
+    for c in chunks:
+        if not c.get("text","").strip(): continue
+        start = (c.get("timestamp") or [0])[0] or 0
+        lines.append(f"[{fmt_ts(start)}] {c['text'].strip()}")
     return "\n".join(lines)
 
 def build_srt(chunks):
-    """Build proper SRT subtitle file from Whisper timestamp chunks."""
-    srt_lines = []
-    idx = 1
-    for chunk in chunks:
-        text = chunk.get("text","").strip()
-        if not text:
-            continue
-        ts   = chunk.get("timestamp", [0, 1])
-        start = ts[0] if ts[0] is not None else 0
-        end   = ts[1] if ts[1] is not None else start + 3
-        srt_lines.append(
-            f"{idx}\n"
-            f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n"
-            f"{text}\n"
-        )
-        idx += 1
-    return "\n".join(srt_lines)
+    out=[]; idx=1
+    for c in chunks:
+        text=c.get("text","").strip()
+        if not text: continue
+        ts=c.get("timestamp",[0,3]) or [0,3]
+        s=ts[0] or 0; e=ts[1] or s+3
+        out.append(f"{idx}\n{fmt_srt(s)} --> {fmt_srt(e)}\n{text}\n"); idx+=1
+    return "\n".join(out)
 
-def send_transcript_email(to_email, filename, transcript, srt_content):
-    """Send transcript by email using SMTP."""
+# ── Spell check ───────────────────────────────────────────────────────────────
+@st.cache_resource
+def load_shona_dictionary():
+    """Load Shona dictionary from GitHub for spell checking."""
+    try:
+        import urllib.request
+        url = "https://raw.githubusercontent.com/stanleymateta-tech/Project-Nyaradzai/main/dictionaries/sn_ZW.dic"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            lines = r.read().decode("utf-8").splitlines()
+        words = set()
+        for i, line in enumerate(lines):
+            if i == 0 or line.startswith("#") or not line.strip(): continue
+            words.add(line.split("/")[0].strip().lower())
+        return words
+    except Exception:
+        return set()
+
+def spell_check_shona(text, dictionary):
+    """Return list of (word, position) tuples for words not in dictionary."""
+    import re
+    if not dictionary: return []
+    issues = []
+    for m in re.finditer(r'\b[a-zA-Z]{2,}\b', text):
+        word = m.group(0)
+        if word.lower() not in dictionary:
+            issues.append(word)
+    return list(set(issues))
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+def summarise_with_claude(transcript, english_translation):
+    """Generate a summary using Claude API."""
+    try:
+        import urllib.request, json
+        text_to_summarise = english_translation if english_translation else transcript
+        payload = json.dumps({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 300,
+            "messages": [{
+                "role": "user",
+                "content": f"Summarise this Shona speech transcript in 2-3 sentences in English. Focus on the main themes and key points.\n\nTranscript:\n{text_to_summarise[:3000]}"
+            }]
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={"Content-Type":"application/json",
+                     "anthropic-version":"2023-06-01"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+        return data["content"][0]["text"]
+    except Exception as e:
+        return f"Summary unavailable: {str(e)}"
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+def send_email(to_email, filename, transcript, srt_content, summary=""):
     try:
         import smtplib, ssl
         from email.mime.multipart import MIMEMultipart
@@ -142,306 +171,336 @@ def send_transcript_email(to_email, filename, transcript, srt_content):
         from email.mime.base import MIMEBase
         from email import encoders
 
-        # Get email credentials from Streamlit secrets
-        smtp_host  = st.secrets.get("SMTP_HOST", "smtp.gmail.com")
-        smtp_port  = int(st.secrets.get("SMTP_PORT", 587))
-        smtp_user  = st.secrets.get("SMTP_USER", "")
-        smtp_pass  = st.secrets.get("SMTP_PASS", "")
+        smtp_host = st.secrets.get("SMTP_HOST","smtp.gmail.com")
+        smtp_port = int(st.secrets.get("SMTP_PORT",587))
+        smtp_user = st.secrets.get("SMTP_USER","")
+        smtp_pass = st.secrets.get("SMTP_PASS","")
 
         if not smtp_user or not smtp_pass:
-            return False, "Email not configured. Download your transcript using the buttons above."
+            return False, "Email not configured — download using the buttons below."
 
         msg = MIMEMultipart()
-        msg["From"]    = smtp_user
-        msg["To"]      = to_email
+        msg["From"] = smtp_user
+        msg["To"]   = to_email
         msg["Subject"] = f"Your Shona Transcript — {filename}"
 
         body = f"""Tatenda — Thank you for using Rurimi RwaAmai!
 
 Your Shona transcript for '{filename}' is attached.
-
-Files attached:
-• {filename}_transcript.txt — Full transcript
-• {filename}.srt — Subtitle file for video editors
-
----
-Rurimi RwaAmai — Mother Tongue
-AI-powered Shona language services
-shona-trascriber.streamlit.app
-*Mutauro wedu, panyika yose* 🇿🇼
 """
-        msg.attach(MIMEText(body, "plain"))
+        if summary:
+            body += f"\n📋 Summary:\n{summary}\n"
+        body += "\nFiles attached:\n• Transcript (.txt)\n• Subtitles (.srt)\n\n---\nRurimi RwaAmai | shona-trascriber.streamlit.app\n*Mutauro wedu, panyika yose* 🇿🇼"
+        msg.attach(MIMEText(body,"plain"))
 
-        # Attach transcript txt
-        txt_part = MIMEBase("application", "octet-stream")
-        txt_part.set_payload(transcript.encode("utf-8"))
-        encoders.encode_base64(txt_part)
-        txt_part.add_header("Content-Disposition",
-                            f"attachment; filename={filename}_transcript.txt")
-        msg.attach(txt_part)
+        for content, fname in [(transcript, f"{filename}_transcript.txt"),
+                                (srt_content, f"{filename}.srt")]:
+            part = MIMEBase("application","octet-stream")
+            part.set_payload(content.encode("utf-8"))
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={fname}")
+            msg.attach(part)
 
-        # Attach SRT
-        srt_part = MIMEBase("application", "octet-stream")
-        srt_part.set_payload(srt_content.encode("utf-8"))
-        encoders.encode_base64(srt_part)
-        srt_part.add_header("Content-Disposition",
-                            f"attachment; filename={filename}.srt")
-        msg.attach(srt_part)
-
-        context = ssl.create_default_context()
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, to_email, msg.as_string())
-
-        return True, f"Transcript sent to {to_email}"
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(smtp_host, smtp_port) as s:
+            s.starttls(context=ctx)
+            s.login(smtp_user, smtp_pass)
+            s.sendmail(smtp_user, to_email, msg.as_string())
+        return True, f"Transcript sent to {to_email} ✅"
     except Exception as e:
-        return False, f"Could not send email: {str(e)}"
+        return False, f"Email failed: {e}"
 
+# ── Translation ───────────────────────────────────────────────────────────────
 def translate_to_english(shona_text):
     try:
-        import transformers
-        transformers.logging.set_verbosity_error()
+        import transformers; transformers.logging.set_verbosity_error()
         from transformers import pipeline
-        translator = pipeline("translation", model="Helsinki-NLP/opus-mt-sn-en")
-        result = translator(shona_text, max_length=512)
-        return result[0]["translation_text"]
+        t = pipeline("translation", model="Helsinki-NLP/opus-mt-sn-en")
+        return t(shona_text, max_length=512)[0]["translation_text"]
     except Exception as e:
-        return f"Translation error: {str(e)}"
+        return f"Translation error: {e}"
 
+# ── Save correction ───────────────────────────────────────────────────────────
 def save_correction(audio_bytes, suffix, original, corrected, filename):
     try:
         from huggingface_hub import HfApi
         import tempfile, os, json
         from datetime import datetime
-        api = HfApi(); ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-        rid = "Starsm91/shona-corrections"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(audio_bytes); tmp = f.name
-        api.upload_file(path_or_fileobj=tmp,
-                        path_in_repo=f"audio/{ts}{suffix}",
-                        repo_id=rid, repo_type="dataset")
-        os.unlink(tmp)
-        meta = json.dumps({"timestamp":ts,"filename":filename,
-                           "original":original,"corrected":corrected},
-                          ensure_ascii=False)
-        api.upload_file(path_or_fileobj=meta.encode(),
-                        path_in_repo=f"corrections/{ts}.json",
-                        repo_id=rid, repo_type="dataset")
+        api=HfApi(); ts=datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        rid="Starsm91/shona-corrections"
+        with tempfile.NamedTemporaryFile(delete=False,suffix=suffix) as f:
+            f.write(audio_bytes); tmp=f.name
+        api.upload_file(path_or_fileobj=tmp,path_in_repo=f"audio/{ts}{suffix}",
+                        repo_id=rid,repo_type="dataset"); os.unlink(tmp)
+        api.upload_file(path_or_fileobj=json.dumps(
+            {"timestamp":ts,"filename":filename,"original":original,"corrected":corrected},
+            ensure_ascii=False).encode(),
+            path_in_repo=f"corrections/{ts}.json",repo_id=rid,repo_type="dataset")
         return True
     except: return False
 
-# ── TAB 1: TRANSCRIPTION ─────────────────────────────────────────────────────
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with tab1:
     with st.sidebar:
         st.header("⚙️ Options")
-        use_timestamps  = st.toggle("🕐 Include timestamps", value=False,
-                                    help="Show [MM:SS] timestamps next to each sentence")
-        use_noise       = st.toggle("🔇 Reduce background noise", value=True)
-        show_translation= st.toggle("🌍 Translate to English", value=False)
-        use_diarisation = st.toggle("👥 Identify speakers", value=False)
+        use_timestamps   = st.toggle("🕐 Timestamps", value=False)
+        use_noise        = st.toggle("🔇 Reduce noise", value=True)
+        show_translation = st.toggle("🌍 Translate to English", value=False)
+        use_summary      = st.toggle("📋 AI Summary", value=False,
+                                     help="Generate a 2-3 sentence English summary using AI")
+        use_spellcheck   = st.toggle("✏️ Spell check", value=False,
+                                     help="Highlight words not in the Shona dictionary")
+        use_diarisation  = st.toggle("👥 Identify speakers", value=False)
         HF_TOKEN = st.secrets.get("HF_TOKEN", None)
         if use_diarisation and not HF_TOKEN:
-            HF_TOKEN = st.text_input("Hugging Face token", type="password")
+            HF_TOKEN = st.text_input("HF token", type="password")
         st.divider()
-        st.markdown("📧 **Email delivery**")
-        email_address = st.text_input("Send transcript to email",
-                                       placeholder="your@email.com",
-                                       help="Enter your email to receive the transcript when done")
+        st.markdown("**📧 Email delivery**")
+        email_address = st.text_input("Send to email",
+                                       placeholder="your@email.com")
         st.divider()
         st.markdown("[Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyaradzai)")
-        st.markdown("[Shona ASR Model](https://huggingface.co/Starsm91/whisper-small-shona)")
 
+    # ── BATCH UPLOAD ──────────────────────────────────────────────────────────
     st.subheader("Upload audio or video → get Shona transcript")
     st.caption("WAV · FLAC · OGG · MP3 · M4A · MP4 · MOV · AVI · MKV · WEBM · OPUS")
 
-    uploaded = st.file_uploader("Choose a file", type=SUPPORTED_TYPES, key="asr_upload")
+    batch_mode = st.checkbox("📁 Batch mode — transcribe multiple files at once",
+                              value=False)
 
-    if uploaded:
-        suffix      = "." + uploaded.name.split(".")[-1].lower()
-        audio_bytes = uploaded.read()
-        if suffix in [".mp4",".mov",".avi",".mkv",".webm"]:
-            st.video(uploaded)
-        else:
-            st.audio(uploaded)
+    if batch_mode:
+        uploaded_files = st.file_uploader(
+            "Upload multiple files", type=SUPPORTED_TYPES,
+            accept_multiple_files=True, key="batch_upload")
 
-        if st.button("🎙 Transcribe", type="primary", use_container_width=True):
-            import transformers
+        if uploaded_files and st.button("🎙 Transcribe All", type="primary",
+                                         use_container_width=True):
+            import transformers, zipfile, io as io_mod
             transformers.logging.set_verbosity_error()
             from transformers import pipeline
 
-            progress = st.progress(0, text="Extracting audio...")
-            with st.spinner(""):
+            asr = pipeline("automatic-speech-recognition",
+                           model="Starsm91/whisper-small-shona",
+                           generate_kwargs={"language":"shona","task":"transcribe"})
+
+            zip_buf = io_mod.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                for i, uf in enumerate(uploaded_files):
+                    suffix = "." + uf.name.split(".")[-1].lower()
+                    audio_bytes = uf.read()
+                    prog = st.progress(0, text=f"Processing {uf.name}...")
+                    try:
+                        arr = get_audio_array(audio_bytes, suffix)
+                        prog.progress(50, text=f"Transcribing {uf.name}...")
+                        result = asr(arr, return_timestamps=True,
+                                     generate_kwargs={"language":"shona","task":"transcribe"})
+                        chunks = result.get("chunks",[])
+                        text = build_timestamped(chunks) if use_timestamps else result["text"].strip()
+                        srt  = build_srt(chunks)
+                        base = uf.name.rsplit(".",1)[0]
+                        zf.writestr(f"{base}_transcript.txt", text)
+                        zf.writestr(f"{base}.srt", srt)
+                        prog.progress(100, text=f"✅ {uf.name} done")
+                        st.success(f"✅ {uf.name} — {len(text.split())} words")
+                    except Exception as e:
+                        st.error(f"❌ {uf.name}: {e}")
+
+            zip_buf.seek(0)
+            st.download_button(
+                "⬇️ Download all transcripts (.zip)",
+                data=zip_buf.read(),
+                file_name="shona_transcripts.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+
+    else:
+        # ── SINGLE FILE ───────────────────────────────────────────────────────
+        uploaded = st.file_uploader("Choose a file", type=SUPPORTED_TYPES,
+                                     key="asr_upload")
+
+        if uploaded:
+            suffix      = "." + uploaded.name.split(".")[-1].lower()
+            audio_bytes = uploaded.read()
+            if suffix in [".mp4",".mov",".avi",".mkv",".webm"]:
+                st.video(uploaded)
+            else:
+                st.audio(uploaded)
+
+            if st.button("🎙 Transcribe", type="primary", use_container_width=True):
+                import transformers
+                transformers.logging.set_verbosity_error()
+                from transformers import pipeline
+
+                prog = st.progress(0, text="Extracting audio...")
                 audio_array = get_audio_array(audio_bytes, suffix)
-            progress.progress(20, text="Audio extracted...")
+                prog.progress(20, text="Audio ready...")
 
-            if use_noise:
-                progress.progress(30, text="Reducing background noise...")
-                try:
-                    import noisereduce as nr
-                    audio_array = nr.reduce_noise(y=audio_array, sr=16000)
-                except: pass
+                if use_noise:
+                    prog.progress(30, text="Reducing noise...")
+                    try:
+                        import noisereduce as nr
+                        audio_array = nr.reduce_noise(y=audio_array, sr=16000)
+                    except: pass
 
-            transcript   = ""
-            chunks       = []
-            srt_content  = ""
+                transcript = ""; chunks = []; srt_content = ""
 
-            if use_diarisation and HF_TOKEN:
-                progress.progress(40, text="Identifying speakers...")
-                try:
-                    import tempfile, soundfile as sf
-                    from pyannote.audio import Pipeline as PyPipeline
-                    tmp_wav = tempfile.mktemp(suffix=".wav")
-                    sf.write(tmp_wav, audio_array, 16000)
-                    pp = PyPipeline.from_pretrained(
-                        "pyannote/speaker-diarization-community-1",
-                        token=HF_TOKEN)
-                    output = pp(tmp_wav)
-                    segments = [(t.start,t.end,s)
+                if use_diarisation and HF_TOKEN:
+                    prog.progress(40, text="Identifying speakers...")
+                    try:
+                        import tempfile, soundfile as sf
+                        from pyannote.audio import Pipeline as PP
+                        tmp_wav = tempfile.mktemp(suffix=".wav")
+                        sf.write(tmp_wav, audio_array, 16000)
+                        pp = PP.from_pretrained("pyannote/speaker-diarization-community-1",
+                                                 token=HF_TOKEN)
+                        output = pp(tmp_wav)
+                        segs = [(t.start,t.end,s)
                                 for t,_,s in output.itertracks(yield_label=True)]
+                        asr = pipeline("automatic-speech-recognition",
+                                       model="Starsm91/whisper-small-shona",
+                                       generate_kwargs={"language":"shona","task":"transcribe"})
+                        lines=[]
+                        for start,end,spk in segs:
+                            seg=audio_array[int(start*16000):int(end*16000)]
+                            if len(seg)<1600: continue
+                            txt=asr(seg.astype(float),
+                                    generate_kwargs={"language":"shona","task":"transcribe"})["text"].strip()
+                            if txt:
+                                ts_str = f"[{fmt_ts(start)}] " if use_timestamps else ""
+                                lines.append(f"{ts_str}{spk.replace('SPEAKER_','Speaker ')}: {txt}")
+                        transcript="\n\n".join(lines)
+                        import os; os.unlink(tmp_wav)
+                    except Exception as e:
+                        st.warning(f"Speaker ID failed: {e}")
+
+                if not transcript:
+                    prog.progress(50, text="Transcribing Shona...")
                     asr = pipeline("automatic-speech-recognition",
                                    model="Starsm91/whisper-small-shona",
                                    generate_kwargs={"language":"shona","task":"transcribe"})
-                    lines = []
-                    for start,end,spk in segments:
-                        s=int(start*16000); e=int(end*16000)
-                        seg=audio_array[s:e]
-                        if len(seg)<1600: continue
-                        txt=asr(seg.astype(float),
-                                generate_kwargs={"language":"shona",
-                                                 "task":"transcribe"})["text"].strip()
-                        if txt:
-                            ts_str = f"[{format_timestamp(start)}] " if use_timestamps else ""
-                            spk_str = spk.replace("SPEAKER_","Speaker ")
-                            lines.append(f"{ts_str}{spk_str}: {txt}")
-                    transcript = "\n\n".join(lines)
-                    import os; os.unlink(tmp_wav)
-                except Exception as e:
-                    st.warning(f"Speaker ID failed: {e}")
+                    result = asr(audio_array, return_timestamps=True,
+                                 generate_kwargs={"language":"shona","task":"transcribe"})
+                    chunks = result.get("chunks",[])
+                    transcript = build_timestamped(chunks) if (use_timestamps and chunks) \
+                                 else result["text"].strip()
 
-            progress.progress(50, text="Transcribing Shona speech...")
-            if not transcript:
-                asr = pipeline("automatic-speech-recognition",
-                               model="Starsm91/whisper-small-shona",
-                               generate_kwargs={"language":"shona","task":"transcribe"})
-                result = asr(audio_array, return_timestamps=True,
-                             generate_kwargs={"language":"shona","task":"transcribe"})
-                chunks = result.get("chunks", [])
+                srt_content = build_srt(chunks) if chunks else \
+                              f"1\n00:00:00,000 --> 00:05:00,000\n{transcript}\n"
 
-                if use_timestamps and chunks:
-                    transcript = build_timestamped_transcript(chunks)
-                else:
-                    transcript = result["text"].strip()
+                english = ""
+                if show_translation:
+                    prog.progress(70, text="Translating to English...")
+                    english = translate_to_english(transcript)
 
-            # Build SRT from chunks
-            if chunks:
-                srt_content = build_srt(chunks)
-            else:
-                srt_content = f"1\n00:00:00,000 --> 00:05:00,000\n{transcript}\n"
+                summary = ""
+                if use_summary:
+                    prog.progress(80, text="Generating AI summary...")
+                    summary = summarise_with_claude(transcript, english)
 
-            progress.progress(80, text="Finishing up...")
+                # Spell check
+                spell_issues = []
+                if use_spellcheck:
+                    prog.progress(85, text="Spell checking...")
+                    dictionary = load_shona_dictionary()
+                    spell_issues = spell_check_shona(transcript, dictionary)
 
-            # Translate if requested
-            english = ""
-            if show_translation and transcript:
-                progress.progress(85, text="Translating to English...")
-                english = translate_to_english(transcript)
+                # Email
+                if email_address and email_address.strip():
+                    prog.progress(90, text="Sending email...")
+                    ok, msg = send_email(email_address.strip(),
+                                         uploaded.name.rsplit(".",1)[0],
+                                         transcript, srt_content, summary)
+                    st.success(msg) if ok else st.info(msg)
 
-            # Send email if address provided
-            if email_address and email_address.strip():
-                progress.progress(90, text="Sending email...")
-                base = uploaded.name.rsplit(".",1)[0]
-                ok, msg = send_transcript_email(
-                    email_address.strip(), base, transcript, srt_content)
-                if ok:
-                    st.success(f"📧 {msg}")
-                else:
-                    st.info(f"📧 {msg}")
+                prog.progress(100, text="Done!")
 
-            progress.progress(100, text="Done!")
+                st.session_state.update({
+                    "transcript": transcript, "english": english,
+                    "summary": summary, "spell_issues": spell_issues,
+                    "audio_bytes": audio_bytes, "suffix": suffix,
+                    "filename": uploaded.name, "srt_content": srt_content,
+                    "chunks": chunks
+                })
 
-            st.session_state["transcript"]  = transcript
-            st.session_state["english"]     = english
-            st.session_state["audio_bytes"] = audio_bytes
-            st.session_state["suffix"]      = suffix
-            st.session_state["filename"]    = uploaded.name
-            st.session_state["srt_content"] = srt_content
-            st.session_state["chunks"]      = chunks
+    # ── RESULTS ───────────────────────────────────────────────────────────────
+    if st.session_state.get("transcript"):
+        transcript   = st.session_state["transcript"]
+        english      = st.session_state.get("english","")
+        summary      = st.session_state.get("summary","")
+        spell_issues = st.session_state.get("spell_issues",[])
+        srt_content  = st.session_state.get("srt_content","")
+        chunks       = st.session_state.get("chunks",[])
 
-    # Show results
-    if st.session_state.get("transcript") or st.session_state.get("english"):
-        transcript  = st.session_state.get("transcript","")
-        english     = st.session_state.get("english","")
-        srt_content = st.session_state.get("srt_content","")
-        chunks      = st.session_state.get("chunks",[])
+        st.success("Transcription complete!")
+        word_count = len(transcript.split())
+        char_count = len(transcript)
+        st.caption(f"**{word_count:,} words · {char_count:,} characters**")
 
-        if transcript:
-            st.success("Transcription complete!")
+        # Summary box
+        if summary:
+            st.info(f"📋 **Summary:** {summary}")
 
-            # Word and character count
-            word_count = len(transcript.split())
-            char_count = len(transcript)
-            st.caption(f"{word_count:,} words · {char_count:,} characters")
+        st.subheader("Shona Transcript")
+        corrected = st.text_area("Review and correct if needed:",
+                                  value=transcript, height=200)
 
-            st.subheader("Shona Transcript")
-            corrected = st.text_area("Review and correct if needed:",
-                                      value=transcript, height=200)
+        # Spell check results
+        if spell_issues:
+            with st.expander(f"✏️ {len(spell_issues)} possible spelling issues"):
+                st.markdown("These words were not found in the Shona dictionary. "
+                            "They may be correct — proper names and rare words may not be listed.")
+                st.write(", ".join(sorted(spell_issues)))
 
-            # Copy button
-            st.code(corrected, language=None)
+        # Copy hint
+        st.caption("💡 Click the text area above and press Ctrl+A then Ctrl+C to copy all")
 
-            if english:
-                st.subheader("🌍 English Translation")
-                st.text_area("English:", value=english, height=120, key="eng_display")
+        if english:
+            st.subheader("🌍 English Translation")
+            st.text_area("English:", value=english, height=120, key="eng_out")
 
-            if transcript and not english:
-                if st.button("🌍 Translate to English", use_container_width=True):
-                    with st.spinner("Translating..."):
-                        eng = translate_to_english(corrected)
-                    st.session_state["english"] = eng
-                    st.text_area("English Translation:", value=eng, height=120)
+        if transcript and not english and show_translation:
+            if st.button("🌍 Translate to English", use_container_width=True):
+                with st.spinner("Translating..."):
+                    eng = translate_to_english(corrected)
+                st.session_state["english"] = eng
+                st.text_area("English:", value=eng, height=120)
 
+        # Download buttons
         base = st.session_state["filename"].rsplit(".",1)[0]
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.download_button("📄 Download .txt",
-                               data=corrected if transcript else english,
+            st.download_button("📄 .txt", data=corrected,
                                file_name=base+"_transcript.txt",
                                mime="text/plain", use_container_width=True)
         with col2:
-            st.download_button("🎬 Download .srt",
-                               data=srt_content,
+            st.download_button("🎬 .srt", data=srt_content,
                                file_name=base+".srt",
                                mime="text/plain", use_container_width=True)
         with col3:
             if chunks:
-                ts_transcript = build_timestamped_transcript(chunks)
-                st.download_button("🕐 Download with timestamps",
-                                   data=ts_transcript,
+                st.download_button("🕐 Timestamped",
+                                   data=build_timestamped(chunks),
                                    file_name=base+"_timestamped.txt",
                                    mime="text/plain", use_container_width=True)
 
-        if transcript:
-            st.divider()
-            st.subheader("Help improve the model")
-            st.markdown("Correct any mistakes above then submit as training data.")
-            if st.button("✅ Submit correction", use_container_width=True):
-                with st.spinner("Saving..."):
-                    saved = save_correction(st.session_state["audio_bytes"],
-                                            st.session_state["suffix"],
-                                            transcript, corrected,
-                                            st.session_state["filename"])
-                st.success("Tatenda! Saved as training data.") if saved else \
-                st.info("Contribute at github.com/stanleymateta-tech/Project-Nyaradzai")
+        st.divider()
+        st.subheader("Help improve the model")
+        if st.button("✅ Submit correction", use_container_width=True):
+            with st.spinner("Saving..."):
+                saved = save_correction(st.session_state["audio_bytes"],
+                                        st.session_state["suffix"],
+                                        transcript, corrected,
+                                        st.session_state["filename"])
+            st.success("Tatenda! Saved as training data.") if saved else \
+            st.info("Contribute at github.com/stanleymateta-tech/Project-Nyaradzai")
 
-# ── TAB 2: TEXT TO SPEECH ─────────────────────────────────────────────────────
+# ── TAB 2: TTS ────────────────────────────────────────────────────────────────
 with tab2:
     st.subheader("Type Shona text → hear it spoken aloud")
     st.markdown("Powered by Meta MMS-TTS Shona voice.")
 
-    shona_text = st.text_area(
-        "Enter Shona text:",
+    shona_text = st.text_area("Enter Shona text:",
         placeholder="Mangwanani. Ndinotenda chaizvo nerubatsiro rwenyu...",
         height=180)
 
@@ -458,34 +517,24 @@ with tab2:
                 import transformers, numpy as np, io, soundfile as sf
                 transformers.logging.set_verbosity_error()
                 from transformers import pipeline
-
                 tts = pipeline("text-to-speech", model="facebook/mms-tts-sna")
                 result = tts(shona_text.strip())
                 audio = np.array(result["audio"]).squeeze()
                 sr    = result["sampling_rate"]
-
                 if speed != 1.0:
                     import librosa
                     audio = librosa.effects.time_stretch(audio, rate=speed)
-
                 buf = io.BytesIO()
-                sf.write(buf, audio, sr, format="WAV")
-                buf.seek(0)
-                audio_bytes_out = buf.read()
-
+                sf.write(buf, audio, sr, format="WAV"); buf.seek(0)
+                audio_out = buf.read()
                 st.success("Audio generated!")
-                st.audio(audio_bytes_out, format="audio/wav")
-                st.download_button("⬇️ Download audio (.wav)",
-                                   data=audio_bytes_out,
-                                   file_name="shona_audio.wav",
-                                   mime="audio/wav",
+                st.audio(audio_out, format="audio/wav")
+                st.download_button("⬇️ Download .wav", data=audio_out,
+                                   file_name="shona_audio.wav", mime="audio/wav",
                                    use_container_width=True)
-
-                duration = len(audio)/sr
-                st.caption(f"{len(shona_text.split())} words · {duration:.1f} seconds")
-
+                st.caption(f"{len(shona_text.split())} words · {len(audio)/sr:.1f} seconds")
             except Exception as e:
-                st.error(f"Could not generate audio: {str(e)}")
+                st.error(f"Could not generate audio: {e}")
 
     st.divider()
     st.markdown("""
