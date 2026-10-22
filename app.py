@@ -19,7 +19,7 @@ Part of [Project Nyaradzai](https://github.com/stanleymateta-tech/Project-Nyarad
 
 st.divider()
 
-tab1, tab2 = st.tabs(["🎤 Transcribe (Speech → Text)", "🔊 Read Aloud (Text → Speech)"])
+tab1, tab2, tab3 = st.tabs(["🎤 Transcribe (Speech → Text)", "🎙 Record & Transcribe", "🔊 Read Aloud (Text → Speech)"])
 
 SUPPORTED_TYPES = [
     "wav","flac","ogg","mp3","m4a","mp4","mov","avi","mkv","webm","aac","opus"
@@ -495,8 +495,140 @@ with tab1:
             st.success("Tatenda! Saved as training data.") if saved else \
             st.info("Contribute at github.com/stanleymateta-tech/Project-Nyaradzai")
 
-# ── TAB 2: TTS ────────────────────────────────────────────────────────────────
+# ── TAB 2: RECORD & TRANSCRIBE ───────────────────────────────────────────────
 with tab2:
+    st.subheader("Record Shona speech → get transcript instantly")
+    st.markdown("""
+    Use your device microphone to record directly in the browser.
+    Works on phones, tablets, and computers — no file upload needed.
+    """)
+
+    # Streamlit audio recorder using st.audio_input (Streamlit 1.23+)
+    st.info("🎙 Click the microphone button below to start recording. Click again to stop.")
+
+    audio_recording = st.audio_input("Record your Shona speech",
+                                      key="mic_recording")
+
+    if audio_recording is not None:
+        st.audio(audio_recording)
+        st.success("Recording captured! Click Transcribe to convert to text.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            rec_timestamps = st.checkbox("Include timestamps", key="rec_ts")
+        with col2:
+            rec_translate  = st.checkbox("Translate to English", key="rec_tr")
+
+        if st.button("🎙 Transcribe Recording", type="primary",
+                     use_container_width=True):
+            import transformers, numpy as np, soundfile as sf, io as io_mod
+            transformers.logging.set_verbosity_error()
+            from transformers import pipeline
+
+            prog = st.progress(0, text="Processing recording...")
+
+            try:
+                # Read the audio recording
+                audio_bytes = audio_recording.read()
+                try:
+                    arr, sr = sf.read(io_mod.BytesIO(audio_bytes))
+                    if len(arr.shape) > 1: arr = arr.mean(axis=1)
+                    if sr != 16000:
+                        import librosa
+                        arr = librosa.resample(arr.astype("float32"),
+                                              orig_sr=sr, target_sr=16000)
+                    arr = arr.astype("float32")
+                except Exception:
+                    try:
+                        import av
+                        container = av.open(io_mod.BytesIO(audio_bytes))
+                        samples = []
+                        resampler = av.AudioResampler(format="fltp",
+                                                       layout="mono", rate=16000)
+                        for frame in container.decode(audio=0):
+                            frame.pts = None
+                            for r in resampler.resample(frame):
+                                samples.append(r.to_ndarray().flatten())
+                        arr = np.concatenate(samples).astype("float32") if samples else None
+                    except Exception:
+                        arr = None
+
+                if arr is None or len(arr) < 1600:
+                    st.warning("Recording too short or could not be processed. "
+                               "Try recording for at least 2 seconds.")
+                else:
+                    prog.progress(40, text="Transcribing Shona...")
+                    asr = pipeline("automatic-speech-recognition",
+                                   model="Starsm91/whisper-small-shona",
+                                   generate_kwargs={"language":"shona","task":"transcribe"})
+                    result = asr(arr, return_timestamps=True,
+                                 generate_kwargs={"language":"shona","task":"transcribe"})
+                    chunks = result.get("chunks",[])
+                    transcript = build_timestamped(chunks) if (rec_timestamps and chunks)                                  else result["text"].strip()
+
+                    prog.progress(80, text="Almost done...")
+
+                    english = ""
+                    if rec_translate and transcript:
+                        english = translate_to_english(transcript)
+
+                    srt = build_srt(chunks) if chunks else                           f"1\n00:00:00,000 --> 00:05:00,000\n{transcript}\n"
+
+                    prog.progress(100, text="Done!")
+
+                    st.success("Transcription complete!")
+                    word_count = len(transcript.split())
+                    st.caption(f"**{word_count:,} words**")
+
+                    corrected = st.text_area("Transcript:", value=transcript,
+                                              height=180, key="rec_transcript")
+
+                    if english:
+                        st.subheader("🌍 English Translation")
+                        st.text_area("English:", value=english, height=100,
+                                     key="rec_english")
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button("📄 Download .txt", data=corrected,
+                                           file_name="recording_transcript.txt",
+                                           mime="text/plain", use_container_width=True)
+                    with col2:
+                        st.download_button("🎬 Download .srt", data=srt,
+                                           file_name="recording.srt",
+                                           mime="text/plain", use_container_width=True)
+
+                    # Submit correction
+                    st.divider()
+                    if st.button("✅ Submit as training data", use_container_width=True):
+                        with st.spinner("Saving..."):
+                            saved = save_correction(audio_bytes, ".wav",
+                                                    transcript, corrected,
+                                                    "microphone_recording")
+                        st.success("Tatenda! Saved.") if saved else                         st.info("Could not save — but your transcript is ready above.")
+
+            except Exception as e:
+                st.error(f"Could not process recording: {e}")
+                st.info("Try refreshing the page and recording again. "
+                        "Make sure your browser has microphone permission.")
+
+    st.divider()
+    st.markdown("""
+    ### Tips for best results:
+    - Speak clearly and at normal pace
+    - Reduce background noise
+    - Hold your device microphone close
+    - Works best on Chrome or Edge browser
+    - On iPhone use Safari for best microphone access
+
+    ### Browser permissions:
+    If the microphone button does not appear, your browser may have blocked
+    microphone access. Click the lock icon in your browser address bar and
+    allow microphone access for this site.
+    """)
+
+# ── TAB 3: TTS ────────────────────────────────────────────────────────────────
+with tab3:
     st.subheader("Type Shona text → hear it spoken aloud")
     st.markdown("Powered by Meta MMS-TTS Shona voice.")
 
